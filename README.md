@@ -1,7 +1,7 @@
 
 <div align="center">
 
-<img src="assets/nexoralogo.jpeg" alt="Nexora Helix" width="700"/>
+<img src="nexoralogo.jpeg" alt="Nexora Helix" width="700"/>
 
 ### ⚙️ ORCHESTRATING AUTONOMOUS INTELLIGENCE ⚙️
 

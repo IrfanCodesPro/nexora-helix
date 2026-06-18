@@ -8,7 +8,30 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const PORT = process.env.PORT || 3000;
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/nexora-helix";
+const MONGODB_URI = process.env.MONGODB_URI;
+let useMongo = false;
+
+// --- JSON File Fallback ---
+const DB_FILE = path.join(process.cwd(), "database.json");
+interface DBState { users: any[]; requests: any[]; }
+
+function initDB(): DBState {
+  if (!fs.existsSync(DB_FILE)) {
+    const initialState: DBState = { users: [], requests: [] };
+    fs.writeFileSync(DB_FILE, JSON.stringify(initialState, null, 2), "utf-8");
+    return initialState;
+  }
+  try {
+    return JSON.parse(fs.readFileSync(DB_FILE, "utf-8"));
+  } catch {
+    const initialState: DBState = { users: [], requests: [] };
+    fs.writeFileSync(DB_FILE, JSON.stringify(initialState, null, 2), "utf-8");
+    return initialState;
+  }
+}
+function writeDB(data: DBState) {
+  fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), "utf-8");
+}
 
 // --- Mongoose Models ---
 
@@ -49,12 +72,18 @@ async function startServer() {
   const app = express();
   app.use(express.json());
 
-  // Connect to MongoDB
-  try {
-    await mongoose.connect(MONGODB_URI);
-    console.log("Connected to MongoDB successfully.");
-  } catch (err) {
-    console.error("MongoDB connection error:", err);
+  // Connect to MongoDB if URI is provided, otherwise use JSON file fallback
+  if (MONGODB_URI) {
+    try {
+      await mongoose.connect(MONGODB_URI);
+      useMongo = true;
+      console.log("Connected to MongoDB successfully.");
+    } catch (err) {
+      console.error("MongoDB connection failed, falling back to JSON file:", err);
+      useMongo = false;
+    }
+  } else {
+    console.log("No MONGODB_URI set. Using local JSON file database.");
   }
 
   // API Endpoints
@@ -66,30 +95,35 @@ async function startServer() {
       return res.status(400).json({ error: "Required fields are missing." });
     }
 
+    const userData = {
+      id: "usr_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+      name, email, password, role, phone,
+      college: role === "student" ? college : undefined,
+      yr: role === "student" ? yr : undefined,
+      dept: role === "student" ? dept : undefined,
+      company: role === "professional" ? company : undefined,
+      designation: role === "professional" ? designation : undefined,
+      created_at: new Date().toISOString()
+    };
+
     try {
-      const existingUser = await UserModel.findOne({ email: new RegExp('^' + email + '$', 'i') });
-      if (existingUser) {
-        return res.status(400).json({ error: "User with this email already exists." });
+      if (useMongo) {
+        const existingUser = await UserModel.findOne({ email: new RegExp('^' + email + '$', 'i') });
+        if (existingUser) return res.status(400).json({ error: "User with this email already exists." });
+        const newUser = await UserModel.create(userData);
+        const obj = newUser.toObject() as any;
+        const { password: _, ...safe } = obj;
+        return res.json({ success: true, user: safe });
+      } else {
+        const db = initDB();
+        if (db.users.find((u: any) => u.email.toLowerCase() === email.toLowerCase())) {
+          return res.status(400).json({ error: "User with this email already exists." });
+        }
+        db.users.push(userData);
+        writeDB(db);
+        const { password: _, ...safe } = userData;
+        return res.json({ success: true, user: safe });
       }
-
-      const newUser = await UserModel.create({
-        id: "usr_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
-        name,
-        email,
-        password, // simple hashing/storing for prototype
-        role, // 'student' | 'professional'
-        phone,
-        college: role === "student" ? college : undefined,
-        yr: role === "student" ? yr : undefined,
-        dept: role === "student" ? dept : undefined,
-        company: role === "professional" ? company : undefined,
-        designation: role === "professional" ? designation : undefined,
-        created_at: new Date().toISOString()
-      });
-
-      const userObject = newUser.toObject();
-      const { password: _, ...userWithoutPassword } = userObject as any;
-      res.json({ success: true, user: userWithoutPassword });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error during registration." });
@@ -99,20 +133,22 @@ async function startServer() {
   // 2. Auth Login
   app.post("/api/auth/login", async (req, res) => {
     const { email, password } = req.body;
-
-    if (!email || !password) {
-      return res.status(400).json({ error: "Email and password are required." });
-    }
+    if (!email || !password) return res.status(400).json({ error: "Email and password are required." });
 
     try {
-      const user = await UserModel.findOne({ email: new RegExp('^' + email + '$', 'i'), password });
-      if (!user) {
-        return res.status(401).json({ error: "Invalid email or password." });
+      if (useMongo) {
+        const user = await UserModel.findOne({ email: new RegExp('^' + email + '$', 'i'), password });
+        if (!user) return res.status(401).json({ error: "Invalid email or password." });
+        const obj = user.toObject() as any;
+        const { password: _, ...safe } = obj;
+        return res.json({ success: true, user: safe });
+      } else {
+        const db = initDB();
+        const user = db.users.find((u: any) => u.email.toLowerCase() === email.toLowerCase() && u.password === password);
+        if (!user) return res.status(401).json({ error: "Invalid email or password." });
+        const { password: _, ...safe } = user;
+        return res.json({ success: true, user: safe });
       }
-
-      const userObject = user.toObject();
-      const { password: _, ...userWithoutPassword } = userObject as any;
-      res.json({ success: true, user: userWithoutPassword });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error during login." });
@@ -122,28 +158,25 @@ async function startServer() {
   // 3. Submit Project Request
   app.post("/api/projects/request", async (req, res) => {
     const { user_email, name, email, phone, what_to_do } = req.body;
+    if (!email || !phone || !what_to_do) return res.status(400).json({ error: "Please input all required request fields." });
 
-    if (!email || !phone || !what_to_do) {
-      return res.status(400).json({ error: "Please input all required request fields." });
-    }
+    const requestData = {
+      id: "req_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
+      user_email: user_email || email, name: name || "Anonymous", email, phone, what_to_do,
+      status: "pending", ppt_url: "", abstract_content: "", rating: 0, feedback: "",
+      created_at: new Date().toISOString()
+    };
 
     try {
-      const newRequest = await RequestModel.create({
-        id: "req_" + Date.now() + "_" + Math.floor(Math.random() * 1000),
-        user_email: user_email || email, // anchor user
-        name: name || "Anonymous",
-        email,
-        phone,
-        what_to_do,
-        status: "pending", // 'pending' | 'in_progress' | 'done'
-        ppt_url: "",
-        abstract_content: "",
-        rating: 0,
-        feedback: "",
-        created_at: new Date().toISOString()
-      });
-
-      res.json({ success: true, request: newRequest });
+      if (useMongo) {
+        const newRequest = await RequestModel.create(requestData);
+        return res.json({ success: true, request: newRequest });
+      } else {
+        const db = initDB();
+        db.requests.push(requestData);
+        writeDB(db);
+        return res.json({ success: true, request: requestData });
+      }
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error during project request." });
@@ -154,13 +187,21 @@ async function startServer() {
   app.get("/api/projects/user/:email", async (req, res) => {
     const { email } = req.params;
     try {
-      const userRequests = await RequestModel.find({
-        $or: [
-          { user_email: new RegExp('^' + email + '$', 'i') },
-          { email: new RegExp('^' + email + '$', 'i') }
-        ]
-      });
-      res.json({ success: true, requests: userRequests });
+      if (useMongo) {
+        const userRequests = await RequestModel.find({
+          $or: [
+            { user_email: new RegExp('^' + email + '$', 'i') },
+            { email: new RegExp('^' + email + '$', 'i') }
+          ]
+        });
+        return res.json({ success: true, requests: userRequests });
+      } else {
+        const db = initDB();
+        const userRequests = db.requests.filter(
+          (r: any) => r.user_email.toLowerCase() === email.toLowerCase() || r.email.toLowerCase() === email.toLowerCase()
+        );
+        return res.json({ success: true, requests: userRequests });
+      }
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error fetching user requests." });
@@ -171,23 +212,26 @@ async function startServer() {
   app.post("/api/projects/rate/:requestId", async (req, res) => {
     const { requestId } = req.params;
     const { rating, feedback } = req.body;
-
     if (typeof rating !== "number" || rating < 1 || rating > 5) {
       return res.status(400).json({ error: "Rating must be between 1 and 5 stars." });
     }
 
     try {
-      const updatedRequest = await RequestModel.findOneAndUpdate(
-        { id: requestId },
-        { rating, feedback: feedback || "" },
-        { new: true }
-      );
-      
-      if (!updatedRequest) {
-        return res.status(404).json({ error: "Project request not found." });
+      if (useMongo) {
+        const updatedRequest = await RequestModel.findOneAndUpdate(
+          { id: requestId }, { rating, feedback: feedback || "" }, { new: true }
+        );
+        if (!updatedRequest) return res.status(404).json({ error: "Project request not found." });
+        return res.json({ success: true, request: updatedRequest });
+      } else {
+        const db = initDB();
+        const reqIndex = db.requests.findIndex((r: any) => r.id === requestId);
+        if (reqIndex === -1) return res.status(404).json({ error: "Project request not found." });
+        db.requests[reqIndex].rating = rating;
+        db.requests[reqIndex].feedback = feedback || "";
+        writeDB(db);
+        return res.json({ success: true, request: db.requests[reqIndex] });
       }
-
-      res.json({ success: true, request: updatedRequest });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error submitting rating." });
@@ -197,15 +241,18 @@ async function startServer() {
   // 6. Admin Panel Retrieve Data
   app.post("/api/admin/data", async (req, res) => {
     const { username, password } = req.body;
-
     if (username !== "NEXORA" || password !== "neXora_helix") {
       return res.status(401).json({ error: "Invalid admin credentials." });
     }
-
     try {
-      const users = await UserModel.find({});
-      const requests = await RequestModel.find({});
-      res.json({ success: true, users, requests });
+      if (useMongo) {
+        const users = await UserModel.find({});
+        const requests = await RequestModel.find({});
+        return res.json({ success: true, users, requests });
+      } else {
+        const db = initDB();
+        return res.json({ success: true, users: db.users, requests: db.requests });
+      }
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error fetching admin data." });
@@ -215,32 +262,30 @@ async function startServer() {
   // 7. Admin Update Project Request (Status + PPT Link + Abstract link)
   app.post("/api/admin/update-request", async (req, res) => {
     const { username, password, requestId, status, ppt_url, abstract_content } = req.body;
-
     if (username !== "NEXORA" || password !== "neXora_helix") {
       return res.status(401).json({ error: "Invalid admin credentials." });
     }
-
-    if (!requestId) {
-      return res.status(400).json({ error: "Request identity parameter is missing." });
-    }
+    if (!requestId) return res.status(400).json({ error: "Request identity parameter is missing." });
 
     try {
-      const updateData: any = {};
-      if (status) updateData.status = status;
-      if (ppt_url !== undefined) updateData.ppt_url = ppt_url;
-      if (abstract_content !== undefined) updateData.abstract_content = abstract_content;
-
-      const updatedRequest = await RequestModel.findOneAndUpdate(
-        { id: requestId },
-        updateData,
-        { new: true }
-      );
-
-      if (!updatedRequest) {
-        return res.status(404).json({ error: "Request not found." });
+      if (useMongo) {
+        const updateData: any = {};
+        if (status) updateData.status = status;
+        if (ppt_url !== undefined) updateData.ppt_url = ppt_url;
+        if (abstract_content !== undefined) updateData.abstract_content = abstract_content;
+        const updatedRequest = await RequestModel.findOneAndUpdate({ id: requestId }, updateData, { new: true });
+        if (!updatedRequest) return res.status(404).json({ error: "Request not found." });
+        return res.json({ success: true, request: updatedRequest });
+      } else {
+        const db = initDB();
+        const reqIndex = db.requests.findIndex((r: any) => r.id === requestId);
+        if (reqIndex === -1) return res.status(404).json({ error: "Request not found." });
+        if (status) db.requests[reqIndex].status = status;
+        if (ppt_url !== undefined) db.requests[reqIndex].ppt_url = ppt_url;
+        if (abstract_content !== undefined) db.requests[reqIndex].abstract_content = abstract_content;
+        writeDB(db);
+        return res.json({ success: true, request: db.requests[reqIndex] });
       }
-
-      res.json({ success: true, request: updatedRequest });
     } catch (err) {
       console.error(err);
       res.status(500).json({ error: "Server error updating request." });

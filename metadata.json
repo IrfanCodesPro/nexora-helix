@@ -1,0 +1,6 @@
+{
+  "name": "Nexora Helix",
+  "description": "Orchestrating Autonomous Intelligence - Premium Student Project Development Platform specializing in Agentic AI, ML, and Full-Stack Solutions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
